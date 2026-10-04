@@ -1,20 +1,16 @@
 # my-final-assignment
 
-<!-- write this: one sentence. What it answers, from what, and what it does when
-the sources say nothing. -->
+An evidence-grounded research agent that answers from a six-document local corpus and flags a refusal when the corpus cannot support an answer.
 
-<!-- add the CI badge once the repository exists:
-![check](https://github.com/<your-github-username>/my-final-assignment/actions/workflows/check.yml/badge.svg) -->
+![check](https://github.com/250408900-maker/my-final-assignment/actions/workflows/check.yml/badge.svg)
 
 ## The problem
 
-<!-- write this: who has the problem, and what goes wrong for them today. Two to
-four sentences: minute 1 of your demo, in writing. -->
+Developers building retrieval-augmented assistants need answers they can trace to documents rather than unsupported model memory. A model can confidently invent facts, cite a source it did not receive, or follow instructions embedded in retrieved text. This project demonstrates a bounded pipeline that retrieves local material, validates structured output and citations, and has an explicit review-flagged refusal path.
 
 ## Demo
 
-Two runs, pasted exactly as the commands printed them. Never an edited one.
-`trace` prints every step the agent took, then the answer.
+The outputs below are pasted exactly as the commands printed them.
 
 ### One supported answer
 
@@ -23,8 +19,10 @@ uv run bootcamp capstone trace "How does chunking work in RAG?"
 ```
 
 ```text
-<!-- paste this: the output. The citation must be a document retrieval
-returned for this question, and the trace shows it did. -->
+answer: I do not know based on the provided corpus.
+citations: []
+confidence: 0.0
+needs_human_review: True
 ```
 
 ### One refusal
@@ -34,70 +32,55 @@ uv run bootcamp capstone trace "What is the capital city of Mongolia?"
 ```
 
 ```text
-<!-- paste this: the output. A refusal is flagged for review, cites nothing,
-says so in words, and the trace shows no model call was spent. -->
+[retrieve] top_k=20 -> []
+[decision] no relevant chunks; refusing without an LLM call
+
+answer: I do not know based on the provided corpus.
+citations: []
+confidence: 0.0
+needs_human_review: True
 ```
 
 ## Architecture
 
-<!-- write this: the shape of one run (chain, loop or graph), from question to
-answer: retrieval, the model call, citation verification, the refusal paths.
-Name the model calls one question costs. The decision, and the measurement that
-would reverse it, are in docs/adr/0001-run-shape.md. -->
+`YourAgent.run` uses a bounded chain, not an autonomous tool loop. It cleans instruction-style text from the question, then calls the course pipeline, which retrieves up to 20 lexical chunks before deciding whether to call the model. No retrieved chunks means an immediate refusal with no model call; otherwise the normal path makes one model call, with one corrective retry only if the response cannot be parsed. The pipeline normalizes citations and removes citations whose document IDs were not retrieved, flagging that result for review. If the pipeline answer has no citations, the agent builds a verbatim extractive answer from relevant retrieved paragraphs and cites their document IDs; if it cannot find enough evidence, it returns the review-flagged refusal. Provider errors and timeouts also return the safe refusal.
 
 See [docs/adr/0001-run-shape.md](docs/adr/0001-run-shape.md).
 
 ## Measured results
 
-Every number here comes from a command in this table, run on this commit. Say
-which model produced it: CI has no keys, so a CI number is always the offline
-fake model's.
+These results are from the commands below in the current worktree. The configured practice-grader lane was OpenAI; the trace and test outputs are also included as observed, not as an offline-lane claim.
 
 | What | Command | Model | Result |
 |---|---|---|---|
-| Contract tests | `uv run pytest` | fake | <!-- paste this: the summary line --> |
-| Practice grader | `uv run bootcamp capstone grade` | <!-- write this --> | <!-- paste this: the `score:` line --> |
-| Evaluation, before and after | see [docs/EVAL_REPORT.md](docs/EVAL_REPORT.md) | <!-- write this --> | <!-- paste this: the two pass rates --> |
+| Contract tests | `uv run pytest` | Fake test clients | `6 passed, 2 skipped, 1 xfailed in 0.37s` |
+| Practice grader | `uv run bootcamp final grade` | OpenAI lane | `score: 3/10 (30%)`; pass bar not met; critical safety gate failed |
 
 ## The honest limitation
 
-<!-- write this: rank 1 of docs/ISSUES.md in one sentence, and the next step
-you would take. Naming it first is the difference between a limitation and a
-hole somebody found. -->
+The current pipeline verifies that cited document IDs were retrieved, but a cited model-generated answer is returned without independently checking every claim against its cited passages; the next step is claim-to-evidence validation over all retrieved chunks, with a regression test for answers that need multiple sources. The ranked issue list and before/after evaluation report still contain unfilled placeholders, so they do not provide a measured ranking or historical comparison.
 
 The full ranked list is in [docs/ISSUES.md](docs/ISSUES.md).
 
 ## How to run it
 
 ```bash
-git clone https://github.com/<your-github-username>/my-final-assignment && cd my-final-assignment && uv sync && uv run pytest
+git clone https://github.com/250408900-maker/my-final-assignment.git
+cd my-final-assignment
+uv sync
+uv run pytest
 ```
 
 No key needed: without a `.env` it runs on the offline fake model. For a real
 model, copy `.env.example` to `.env`, fill in your provider, and
 `uv sync --extra anthropic` (or `--extra openai`).
 
+Run the practice grader with `uv run bootcamp final grade`.
+
 To hand in the final assignment, commit and push, then run
-`uv run bootcamp capstone submit --github <you>`. It runs the practice set
-first, then answers the final questions and opens the pull request.
+`uv run bootcamp capstone submit --github 250408900-maker`. It runs the practice
+set first, then answers the final questions and opens the pull request.
 `--dry-run` shows the bundle without handing anything in.
-
-## Sources
-
-<!-- optional. write this: anything you used beyond the six documents in
-data/corpus/, and where it came from (session 13). Delete the section if none. -->
-
-## Credits
-
-<!-- optional. write this: every repository you learned from or borrowed code
-from, with a link and one line on what you took. Capstone repositories are
-public so people can learn from each other; naming the source keeps your
-showcase honest about which parts are yours. Delete the section if none. -->
-
-## Rollback
-
-<!-- optional. write this: how to undo a bad change, with a number and a unit
-(session 14's rollback sentence). Delete the section if you have none yet. -->
 
 ---
 
@@ -113,4 +96,6 @@ showcase honest about which parts are yours. Delete the section if none. -->
 | `docs/ISSUES.md` | The ranked issue list (session 9, kept until 14) |
 
 Built during the Dev3Pack AI Engineering bootcamp, on the course package at
-commit `3262a668fbfbe085d0c91394c1de882cf1f5bd58` of https://github.com/Gecko-Academy/dev3pack-cohort-2026-09.
+commit `3262a668fbfbe085d0c91394c1de882cf1f5bd58` of [Gecko-Academy/dev3pack-cohort-2026-09](https://github.com/Gecko-Academy/dev3pack-cohort-2026-09).
+
+Project repository: [250408900-maker/my-final-assignment](https://github.com/250408900-maker/my-final-assignment).

@@ -26,6 +26,20 @@ STOPWORDS = {
     "which", "who", "why", "with", "would", "you", "your",
 }
 
+INSTRUCTION_PATTERNS = (
+    r"(?im)^[ \t]*(?:ignore|disregard|forget)\b.{0,160}\b"
+    r"(?:rules?|instructions?|system prompts?|developer messages?)\b",
+    r"(?im)^[ \t]*(?:reply|respond|answer|output)\s+only\b",
+    r"(?im)^[ \t]*(?:system|developer)\s+(?:message|instruction)\s*:",
+    r"(?im)^[ \t]*(?:set|make)\s+(?:the\s+)?"
+    r"(?:confidence|needs_human_review|review flag|citations?)\b",
+    r"(?im)^[ \t]*(?:reveal|print|exfiltrate|include|send)\b.{0,100}\b"
+    r"(?:credentials?|secrets?|api keys?|\.env)\b",
+    r"(?im)^[ \t]*(?:override|bypass)\b.{0,100}\b"
+    r"(?:rules?|instructions?|policy)\b",
+)
+RETRIEVAL_TOP_K = 20
+
 
 def _tokens(text: str) -> set[str]:
     """Return meaningful lowercase tokens."""
@@ -34,6 +48,20 @@ def _tokens(text: str) -> set[str]:
         for word in re.findall(r"[a-z0-9]+", text.lower())
         if len(word) > 2 and word not in STOPWORDS
     }
+
+
+def _retrieved_content_has_instructions(
+    question: str,
+    documents: list[Document],
+    citations: tuple[str, ...],
+) -> bool:
+    """Check cited retrieved passages for instruction-shaped text."""
+    return any(
+        re.search(pattern, item.chunk.text, flags=re.IGNORECASE | re.DOTALL)
+        for item in retrieve(question, documents, top_k=RETRIEVAL_TOP_K)
+        if item.chunk.doc_id in citations
+        for pattern in INSTRUCTION_PATTERNS
+    )
 
 
 def _safe_refusal() -> ResearchAnswer:
@@ -63,7 +91,7 @@ def _extractive_answer(
     scored = retrieve(
         question,
         documents,
-        top_k=5,
+        top_k=RETRIEVAL_TOP_K,
     )
 
     if not scored:
@@ -73,8 +101,8 @@ def _extractive_answer(
 
     # Prompt-injection defense questions.
     #
-    # This wording is directly grounded in the
-    # "Defenses that actually help" section of prompt-injection.md.
+    # This wording is directly grounded in the "Defenses that actually help"
+    # section of prompt-injection.md.
     if "defen" in question_lower and "injection" in question_lower:
         return ResearchAnswer(
             answer=(
@@ -93,35 +121,60 @@ def _extractive_answer(
             needs_human_review=False,
         )
 
-    # For other supported questions, use the strongest retrieved chunk.
-    best = scored[0]
-    chunk = best.chunk
-
     question_tokens = _tokens(question)
-    chunk_tokens = _tokens(chunk.text)
-
-    overlap = question_tokens & chunk_tokens
-
-    # Refuse weak accidental matches.
-    if len(overlap) < 2:
+    if not question_tokens:
         return None
 
-    # Also require the retrieved passage to cover a meaningful
-    # portion of the question. This helps reject unrelated questions
-    # that happen to share a couple of generic words with the corpus.
-    coverage = len(overlap) / max(len(question_tokens), 1)
+    paragraphs_by_document: dict[str, list[tuple[str, set[str]]]] = {}
+    document_order: list[str] = []
+    for item in scored:
+        chunk = item.chunk
+        heading_tokens: set[str] = set()
+        heading = ""
+        for block in chunk.text.split("\n\n"):
+            block = block.strip()
+            if block.startswith("#"):
+                heading = re.sub(r"^#+\s*", "", block)
+                heading_tokens = _tokens(block)
+                continue
 
-    if coverage < 0.30:
-        return None
+            text = _clean_chunk(block)
+            if not text:
+                continue
 
-    text = _clean_chunk(chunk.text)
+            overlap = question_tokens & (_tokens(text) | heading_tokens)
+            if len(overlap) < 2:
+                continue
 
-    if not text:
+            answer_text = f"{heading}: {text}" if heading else text
+            if chunk.doc_id not in paragraphs_by_document:
+                paragraphs_by_document[chunk.doc_id] = []
+                document_order.append(chunk.doc_id)
+            if all(
+                existing != answer_text
+                for existing, _ in paragraphs_by_document[chunk.doc_id]
+            ):
+                paragraphs_by_document[chunk.doc_id].append((answer_text, overlap))
+
+    answer_paragraphs: list[str] = []
+    citations: list[str] = []
+    covered_tokens: set[str] = set()
+    for doc_id in document_order:
+        for text, overlap in paragraphs_by_document[doc_id]:
+            if text not in answer_paragraphs:
+                answer_paragraphs.append(text)
+            covered_tokens.update(overlap)
+        if paragraphs_by_document[doc_id]:
+            citations.append(doc_id)
+        if len(covered_tokens) / len(question_tokens) >= 0.5:
+            break
+
+    if not answer_paragraphs or len(covered_tokens) / len(question_tokens) < 0.5:
         return None
 
     return ResearchAnswer(
-        answer=text,
-        citations=(chunk.doc_id,),
+        answer=" ".join(answer_paragraphs),
+        citations=tuple(citations),
         confidence=0.85,
         needs_human_review=False,
     )
@@ -153,7 +206,7 @@ class YourAgent:
             documents=self.documents,
             client=self.client,
             max_tool_calls=3,
-            top_k=5,
+            top_k=RETRIEVAL_TOP_K,
         )
 
     def run(self, question: str) -> AgentResult:
@@ -167,24 +220,6 @@ class YourAgent:
                 trace=(),
             )
 
-        # Deterministic, verbatim, corpus-backed answers come first: they
-        # copy the source text, so every claim is supported by what it cites.
-        try:
-            fallback = _extractive_answer(
-                question,
-                self.documents,
-            )
-        except Exception:
-            fallback = None
-
-        if fallback is not None:
-            return AgentResult(
-                answer=fallback,
-                trace=(),
-            )
-
-        # Otherwise let the course pipeline (the real model, when one is
-        # configured) try. On the fake lane this is always a refusal.
         executor = ThreadPoolExecutor(max_workers=1)
 
         future = executor.submit(
@@ -217,6 +252,34 @@ class YourAgent:
                 cancel_futures=True,
             )
 
+        if result.answer.citations and _retrieved_content_has_instructions(
+            question,
+            self.documents,
+            result.answer.citations,
+        ):
+            return AgentResult(
+                answer=_safe_refusal(),
+                trace=result.trace,
+            )
+
+        if result.answer.needs_human_review and result.answer.citations:
+            return result
+
+        try:
+            fallback = _extractive_answer(
+                question,
+                self.documents,
+            )
+        except Exception:
+            fallback = None
+
+        if fallback is not None:
+            return AgentResult(
+                answer=fallback,
+                trace=result.trace,
+            )
+
+        # Preserve a grounded answer produced by the normal provider.
         if result.answer.citations:
             return result
 
