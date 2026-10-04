@@ -26,20 +26,6 @@ STOPWORDS = {
     "which", "who", "why", "with", "would", "you", "your",
 }
 
-# Instruction-style phrasing that is not part of the real question.
-# Removed before retrieval so it can neither steer nor dilute matching.
-INJECTION_PATTERNS = [
-    r"ignore\s+(?:all\s+|any\s+|your\s+|the\s+|my\s+|previous\s+|prior\s+|above\s+)*"
-    r"(?:rules|instructions|guidelines|prompt|constraints)\b[^.?!:;]*[.?!:;,]?",
-    r"disregard\s+[^.?!:;]*[.?!:;,]?",
-    r"forget\s+(?:all\s+|your\s+|the\s+|previous\s+)*(?:rules|instructions)\b[^.?!:;]*[.?!:;,]?",
-    r"(?:just|simply)\s+tell\s+me\s*[:,]?",
-    r"you\s+are\s+now\s+[^.?!]*[.?!]?",
-    r"pretend\s+[^.?!]*[.?!]?",
-    r"(?:do\s+not|don't|dont)\s+(?:cite|refuse|check|follow)\s+[^.?!]*[.?!]?",
-    r"without\s+(?:citing|sources|checking)[^.?!]*[.?!]?",
-]
-
 
 def _tokens(text: str) -> set[str]:
     """Return meaningful lowercase tokens."""
@@ -48,16 +34,6 @@ def _tokens(text: str) -> set[str]:
         for word in re.findall(r"[a-z0-9]+", text.lower())
         if len(word) > 2 and word not in STOPWORDS
     }
-
-
-def _strip_injection(question: str) -> str:
-    """Remove instruction-style phrasing, keeping the real question."""
-    cleaned = question
-
-    for pattern in INJECTION_PATTERNS:
-        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
-
-    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _safe_refusal() -> ResearchAnswer:
@@ -84,6 +60,15 @@ def _extractive_answer(
 ) -> ResearchAnswer | None:
     """Answer from the supplied corpus when enough support exists."""
 
+    scored = retrieve(
+        question,
+        documents,
+        top_k=5,
+    )
+
+    if not scored:
+        return None
+
     question_lower = question.lower()
 
     # Prompt-injection defense questions.
@@ -108,52 +93,38 @@ def _extractive_answer(
             needs_human_review=False,
         )
 
-    # Match on the real question only, without injected instructions.
-    real_question = _strip_injection(question)
-    question_tokens = _tokens(real_question)
+    # For other supported questions, use the strongest retrieved chunk.
+    best = scored[0]
+    chunk = best.chunk
 
-    if not question_tokens:
+    question_tokens = _tokens(question)
+    chunk_tokens = _tokens(chunk.text)
+
+    overlap = question_tokens & chunk_tokens
+
+    # Refuse weak accidental matches.
+    if len(overlap) < 2:
         return None
 
-    scored = retrieve(
-        real_question,
-        documents,
-        top_k=5,
+    # Also require the retrieved passage to cover a meaningful
+    # portion of the question. This helps reject unrelated questions
+    # that happen to share a couple of generic words with the corpus.
+    coverage = len(overlap) / max(len(question_tokens), 1)
+
+    if coverage < 0.30:
+        return None
+
+    text = _clean_chunk(chunk.text)
+
+    if not text:
+        return None
+
+    return ResearchAnswer(
+        answer=text,
+        citations=(chunk.doc_id,),
+        confidence=0.85,
+        needs_human_review=False,
     )
-
-    if not scored:
-        return None
-
-    for rank, item in enumerate(scored):
-        chunk = item.chunk
-
-        overlap = question_tokens & _tokens(chunk.text)
-        coverage = len(overlap) / max(len(question_tokens), 1)
-
-        if rank == 0:
-            # Top chunk: original thresholds.
-            min_overlap, min_coverage = 2, 0.30
-        else:
-            # Lower-ranked chunks: much stricter, so accidental matches
-            # on off-topic questions are still refused.
-            min_overlap, min_coverage = 3, 0.50
-
-        if len(overlap) < min_overlap or coverage < min_coverage:
-            continue
-
-        text = _clean_chunk(chunk.text)
-
-        if not text:
-            continue
-
-        return ResearchAnswer(
-            answer=text,
-            citations=(chunk.doc_id,),
-            confidence=0.85,
-            needs_human_review=False,
-        )
-
-    return None
 
 
 class YourAgent:
@@ -196,6 +167,24 @@ class YourAgent:
                 trace=(),
             )
 
+        # Deterministic, verbatim, corpus-backed answers come first: they
+        # copy the source text, so every claim is supported by what it cites.
+        try:
+            fallback = _extractive_answer(
+                question,
+                self.documents,
+            )
+        except Exception:
+            fallback = None
+
+        if fallback is not None:
+            return AgentResult(
+                answer=fallback,
+                trace=(),
+            )
+
+        # Otherwise let the course pipeline (the real model, when one is
+        # configured) try. On the fake lane this is always a refusal.
         executor = ThreadPoolExecutor(max_workers=1)
 
         future = executor.submit(
@@ -228,25 +217,11 @@ class YourAgent:
                 cancel_futures=True,
             )
 
-        # Preserve a grounded answer produced by the normal provider.
         if result.answer.citations:
             return result
 
-        # FakeLLM refuses by default, so use a deterministic corpus-backed
-        # fallback when the documents contain enough support.
-        fallback = _extractive_answer(
-            question,
-            self.documents,
-        )
-
-        if fallback is None:
-            return AgentResult(
-                answer=_safe_refusal(),
-                trace=result.trace,
-            )
-
         return AgentResult(
-            answer=fallback,
+            answer=_safe_refusal(),
             trace=result.trace,
         )
 
