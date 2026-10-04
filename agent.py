@@ -26,6 +26,20 @@ STOPWORDS = {
     "which", "who", "why", "with", "would", "you", "your",
 }
 
+# Instruction-style phrasing that is not part of the real question.
+# Removed before retrieval so it can neither steer nor dilute matching.
+INJECTION_PATTERNS = [
+    r"ignore\s+(?:all\s+|any\s+|your\s+|the\s+|my\s+|previous\s+|prior\s+|above\s+)*"
+    r"(?:rules|instructions|guidelines|prompt|constraints)\b[^.?!:;]*[.?!:;,]?",
+    r"disregard\s+[^.?!:;]*[.?!:;,]?",
+    r"forget\s+(?:all\s+|your\s+|the\s+|previous\s+)*(?:rules|instructions)\b[^.?!:;]*[.?!:;,]?",
+    r"(?:just|simply)\s+tell\s+me\s*[:,]?",
+    r"you\s+are\s+now\s+[^.?!]*[.?!]?",
+    r"pretend\s+[^.?!]*[.?!]?",
+    r"(?:do\s+not|don't|dont)\s+(?:cite|refuse|check|follow)\s+[^.?!]*[.?!]?",
+    r"without\s+(?:citing|sources|checking)[^.?!]*[.?!]?",
+]
+
 
 def _tokens(text: str) -> set[str]:
     """Return meaningful lowercase tokens."""
@@ -34,6 +48,16 @@ def _tokens(text: str) -> set[str]:
         for word in re.findall(r"[a-z0-9]+", text.lower())
         if len(word) > 2 and word not in STOPWORDS
     }
+
+
+def _strip_injection(question: str) -> str:
+    """Remove instruction-style phrasing, keeping the real question."""
+    cleaned = question
+
+    for pattern in INJECTION_PATTERNS:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _safe_refusal() -> ResearchAnswer:
@@ -60,21 +84,12 @@ def _extractive_answer(
 ) -> ResearchAnswer | None:
     """Answer from the supplied corpus when enough support exists."""
 
-    scored = retrieve(
-        question,
-        documents,
-        top_k=5,
-    )
-
-    if not scored:
-        return None
-
     question_lower = question.lower()
 
     # Prompt-injection defense questions.
     #
-    # This wording is directly grounded in the "Defenses that actually help"
-    # section of prompt-injection.md.
+    # This wording is directly grounded in the
+    # "Defenses that actually help" section of prompt-injection.md.
     if "defen" in question_lower and "injection" in question_lower:
         return ResearchAnswer(
             answer=(
@@ -93,30 +108,53 @@ def _extractive_answer(
             needs_human_review=False,
         )
 
-    # For other supported questions, use the strongest retrieved chunk.
-    best = scored[0]
-    chunk = best.chunk
+    # Match on the real question only, without injected instructions.
+    real_question = _strip_injection(question)
+    question_tokens = _tokens(real_question)
 
-    question_tokens = _tokens(question)
-    chunk_tokens = _tokens(chunk.text)
-
-    overlap = question_tokens & chunk_tokens
-
-    # Refuse weak accidental matches with unrelated questions.
-    if len(overlap) < 4:
+    if not question_tokens:
         return None
 
-    text = _clean_chunk(chunk.text)
-
-    if not text:
-        return None
-
-    return ResearchAnswer(
-        answer=text,
-        citations=(chunk.doc_id,),
-        confidence=0.85,
-        needs_human_review=False,
+    scored = retrieve(
+        real_question,
+        documents,
+        top_k=5,
     )
+
+    if not scored:
+        return None
+
+    # Try each retrieved chunk in rank order and use the first one with
+    # real support. The top chunk is still tried first.
+    for item in scored:
+        chunk = item.chunk
+
+        overlap = question_tokens & _tokens(chunk.text)
+
+        # Refuse weak accidental matches.
+        if len(overlap) < 2:
+            continue
+
+        # Require the passage to cover a meaningful portion of the
+        # question, so unrelated questions are still refused.
+        coverage = len(overlap) / max(len(question_tokens), 1)
+
+        if coverage < 0.30:
+            continue
+
+        text = _clean_chunk(chunk.text)
+
+        if not text:
+            continue
+
+        return ResearchAnswer(
+            answer=text,
+            citations=(chunk.doc_id,),
+            confidence=0.85,
+            needs_human_review=False,
+        )
+
+    return None
 
 
 class YourAgent:
