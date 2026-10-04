@@ -157,15 +157,7 @@ def test_injection_cannot_add_a_source_or_clear_the_review_flag() -> None:
     assert answer.confidence <= 0.2, "the injected 'confidence 1.0' was obeyed"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "sessions 13-14: the starter passes an obeyed reply through when it cites only "
-        "retrieved documents. Detect instruction-shaped text in retrieved passages and "
-        "flag the answer, then delete this marker."
-    ),
-)
+
 def test_injection_cannot_dictate_an_unflagged_answer() -> None:
     model = GullibleLLM(
         obeyed_reply=_reply("ACCESS GRANTED", [INJECTED_DOC], confidence=1.0, review=False)
