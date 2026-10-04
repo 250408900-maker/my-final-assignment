@@ -103,7 +103,7 @@ def _extractive_answer(
     overlap = question_tokens & chunk_tokens
 
     # Refuse weak accidental matches with unrelated questions.
-    if len(overlap) < 2:
+    if len(overlap) < 3:
         return None
 
     text = _clean_chunk(chunk.text)
