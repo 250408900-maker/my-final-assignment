@@ -6,7 +6,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 
-from bootcamp_agent.agent import AgentResult, answer_question
+from bootcamp_agent.agent import AgentResult, TraceEvent, answer_question
 from bootcamp_agent.config import load_settings
 from bootcamp_agent.documents import Document, load_corpus
 from bootcamp_agent.llm import LLMClient, get_client
@@ -39,6 +39,7 @@ INSTRUCTION_PATTERNS = (
     r"(?:rules?|instructions?|policy)\b",
 )
 RETRIEVAL_TOP_K = 20
+MIN_GROUNDING_COVERAGE = 0.4
 
 
 def _tokens(text: str) -> set[str]:
@@ -48,6 +49,27 @@ def _tokens(text: str) -> set[str]:
         for word in re.findall(r"[a-z0-9]+", text.lower())
         if len(word) > 2 and word not in STOPWORDS
     }
+
+
+def _grounding_question(question: str) -> str:
+    """Drop a leading override directive when a substantive question follows."""
+    directive = re.match(
+        r"^\s*(?:(?:system|developer)\s+override\b|"
+        r"ignore\b|disregard\b|forget\b|bypass\b)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if directive is None:
+        return question.strip()
+
+    substantive = re.search(
+        r"\b(?:what|how|why|when|where|who|which)\b",
+        question[directive.end():],
+        flags=re.IGNORECASE,
+    )
+    if substantive is None:
+        return ""
+    return question[directive.end() + substantive.start():].strip()
 
 
 def _retrieved_content_has_instructions(
@@ -88,6 +110,7 @@ def _extractive_answer(
 ) -> ResearchAnswer | None:
     """Answer from the supplied corpus when enough support exists."""
 
+    question = _grounding_question(question)
     scored = retrieve(
         question,
         documents,
@@ -166,10 +189,13 @@ def _extractive_answer(
             covered_tokens.update(overlap)
         if paragraphs_by_document[doc_id]:
             citations.append(doc_id)
-        if len(covered_tokens) / len(question_tokens) >= 0.5:
+        if len(covered_tokens) / len(question_tokens) >= MIN_GROUNDING_COVERAGE:
             break
 
-    if not answer_paragraphs or len(covered_tokens) / len(question_tokens) < 0.5:
+    if (
+        not answer_paragraphs
+        or len(covered_tokens) / len(question_tokens) < MIN_GROUNDING_COVERAGE
+    ):
         return None
 
     return ResearchAnswer(
@@ -262,7 +288,11 @@ class YourAgent:
                 trace=result.trace,
             )
 
-        if result.answer.needs_human_review and result.answer.citations:
+        if result.answer.needs_human_review and result.answer.citations and any(
+            event.kind == "decision"
+            and event.detail.startswith("fabricated citations stripped:")
+            for event in result.trace
+        ):
             return result
 
         try:
@@ -274,9 +304,26 @@ class YourAgent:
             fallback = None
 
         if fallback is not None:
+            if _retrieved_content_has_instructions(
+                question,
+                self.documents,
+                fallback.citations,
+            ):
+                return AgentResult(
+                    answer=_safe_refusal(),
+                    trace=result.trace,
+                )
+
             return AgentResult(
                 answer=fallback,
-                trace=result.trace,
+                trace=(
+                    *result.trace,
+                    TraceEvent(
+                        "decision",
+                        "corpus-backed fallback answered with citations "
+                        f"{list(fallback.citations)}",
+                    ),
+                ),
             )
 
         # Preserve a grounded answer produced by the normal provider.
