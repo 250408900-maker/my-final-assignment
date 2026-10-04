@@ -86,6 +86,41 @@ def _retrieved_content_has_instructions(
     )
 
 
+def _has_cited_question_support(
+    question: str,
+    documents: list[Document],
+    citations: tuple[str, ...],
+) -> bool:
+    """Require cited passages to match a substantive share of the question."""
+    question = _grounding_question(question)
+    question_tokens = _tokens(question)
+    if not question_tokens:
+        return False
+
+    covered_tokens: set[str] = set()
+    for item in retrieve(question, documents, top_k=RETRIEVAL_TOP_K):
+        if item.chunk.doc_id not in citations:
+            continue
+
+        heading_tokens: set[str] = set()
+        for block in item.chunk.text.split("\n\n"):
+            block = block.strip()
+            if block.startswith("#"):
+                heading_tokens = _tokens(block)
+                continue
+
+            overlap = question_tokens & (_tokens(_clean_chunk(block)) | heading_tokens)
+            if (
+                len(overlap) >= 2
+                and len(overlap) / len(question_tokens) >= MIN_GROUNDING_COVERAGE
+            ):
+                covered_tokens.update(overlap)
+
+    return (
+        len(covered_tokens) / len(question_tokens) >= MIN_GROUNDING_COVERAGE
+    )
+
+
 def _safe_refusal() -> ResearchAnswer:
     """Return a visible refusal for unsupported questions."""
     return ResearchAnswer(
@@ -166,7 +201,10 @@ def _extractive_answer(
                 continue
 
             overlap = question_tokens & (_tokens(text) | heading_tokens)
-            if len(overlap) < 2:
+            if (
+                len(overlap) < 2
+                or len(overlap) / len(question_tokens) < MIN_GROUNDING_COVERAGE
+            ):
                 continue
 
             answer_text = f"{heading}: {text}" if heading else text
@@ -326,8 +364,12 @@ class YourAgent:
                 ),
             )
 
-        # Preserve a grounded answer produced by the normal provider.
-        if result.answer.citations:
+        # Preserve a provider answer only when its cited passages support the query.
+        if result.answer.citations and _has_cited_question_support(
+            question,
+            self.documents,
+            result.answer.citations,
+        ):
             return result
 
         return AgentResult(
