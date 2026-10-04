@@ -124,22 +124,21 @@ def _extractive_answer(
     if not scored:
         return None
 
-    # Try each retrieved chunk in rank order and use the first one with
-    # real support. The top chunk is still tried first.
-    for item in scored:
+    for rank, item in enumerate(scored):
         chunk = item.chunk
 
         overlap = question_tokens & _tokens(chunk.text)
-
-        # Refuse weak accidental matches.
-        if len(overlap) < 2:
-            continue
-
-        # Require the passage to cover a meaningful portion of the
-        # question, so unrelated questions are still refused.
         coverage = len(overlap) / max(len(question_tokens), 1)
 
-        if coverage < 0.30:
+        if rank == 0:
+            # Top chunk: original thresholds.
+            min_overlap, min_coverage = 2, 0.30
+        else:
+            # Lower-ranked chunks: much stricter, so accidental matches
+            # on off-topic questions are still refused.
+            min_overlap, min_coverage = 3, 0.50
+
+        if len(overlap) < min_overlap or coverage < min_coverage:
             continue
 
         text = _clean_chunk(chunk.text)
